@@ -1,0 +1,5 @@
+{
+  "name": "PromptFlow Director's Cut",
+  "description": "A professional anime storyboard generation platform using Gemini for visual style distillation, script deduction, and high-quality image rendering.",
+  "requestFramePermissions": []
+}
