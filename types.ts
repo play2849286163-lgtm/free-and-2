@@ -8,9 +8,11 @@ export interface Asset {
   id: string;
   name: string;
   type: 'character' | 'scene';
-  images: AssetImage[]; // 改为对象数组支持个体状态
+  images: AssetImage[];
   isActive: boolean;
 }
+
+export type ProductionMode = 'anime' | 'cinematic';
 
 export interface Shot {
   id: string;
@@ -41,6 +43,7 @@ export interface StyleDistillation {
   technicalParams: string;
   colorPalette: string;
   hexCodes: string[];
+  detectedMedium: 'illustration' | 'photorealistic' | 'unknown';
 }
 
 export enum AppStatus {

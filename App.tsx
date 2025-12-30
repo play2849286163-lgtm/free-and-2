@@ -1,19 +1,20 @@
 
-import React, { useState, useRef, useEffect, useMemo } from 'react';
-import { Shot, StyleDistillation, AppStatus, Asset, AssetImage } from './types';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { Shot, StyleDistillation, AppStatus, AssetImage, ProductionMode } from './types';
 import { distillStyle, deductStoryboard, renderShot, removeWatermark } from './geminiService';
 import { db } from './db';
 
 const MASTER_KEYS = {
-  ASSETS: 'pf_master_assets_v3_final_v6',
-  STYLE: 'pf_master_style_v3_final_v6',
-  SCRIPT: 'pf_master_script_v3_final_v6',
-  IMAGES: 'pf_master_images_v3_final_v6',
-  SHOTS: 'pf_master_shots_v3_final_v6',
-  THEME: 'pf_master_theme_v3_final_v6'
+  ASSETS: 'pf_master_assets_v30',
+  STYLE: 'pf_master_style_v30',
+  SCRIPT: 'pf_master_script_v30',
+  IMAGES: 'pf_master_images_v30',
+  SHOTS: 'pf_master_shots_v30',
+  THEME: 'pf_master_theme_v30',
+  MODE: 'pf_master_mode_v30'
 };
 
-const compressImage = (base64Str: string, maxWidth = 1024, quality = 0.5): Promise<string> => {
+const compressImage = (base64Str: string, maxWidth = 1024, quality = 0.6): Promise<string> => {
   return new Promise((resolve) => {
     const img = new Image();
     img.src = base64Str;
@@ -34,825 +35,585 @@ const compressImage = (base64Str: string, maxWidth = 1024, quality = 0.5): Promi
       }
       resolve(canvas.toDataURL('image/jpeg', quality));
     };
-    img.onerror = () => resolve(base64Str);
   });
 };
-
-interface PurifyItem {
-  id: string;
-  input: string;
-  output?: string;
-  status: 'pending' | 'working' | 'done' | 'error';
-}
-
-type SortOption = 'name-asc' | 'name-desc' | 'newest' | 'oldest' | 'status';
-type FilterOption = 'all' | 'active' | 'inactive';
 
 const App: React.FC = () => {
   const [isLoaded, setIsLoaded] = useState(false);
   const [showWelcome, setShowWelcome] = useState(true);
-  const [hasApiKey, setHasApiKey] = useState(false);
-  const [theme, setTheme] = useState<'light' | 'dark'>('light');
+  const [theme, setTheme] = useState<'light' | 'dark'>('dark');
+  const [productionMode, setProductionMode] = useState<ProductionMode>('cinematic');
   
   const [images, setImages] = useState<string[]>([]);
   const [style, setStyle] = useState<StyleDistillation | null>(null);
   const [script, setScript] = useState('');
-  const [freePrompt, setFreePrompt] = useState('');
   const [shots, setShots] = useState<Shot[]>([]);
   const [status, setStatus] = useState<AppStatus>(AppStatus.IDLE);
   const [aspectRatio, setAspectRatio] = useState<string>("16:9");
   const [shotCount, setShotCount] = useState<number>(4);
-  
-  const [assets, setAssets] = useState<Asset[]>([]);
-  const [sortBy, setSortBy] = useState<SortOption>('newest');
-  const [filterByStatus, setFilterByStatus] = useState<FilterOption>('all');
-  
-  const [draggedAssetId, setDraggedAssetId] = useState<string | null>(null);
-  const [dragOverAssetId, setDragOverAssetId] = useState<string | null>(null);
-  const [showAssetCreator, setShowAssetCreator] = useState<{type: 'character' | 'scene', editId?: string} | null>(null);
-  const [newAssetName, setNewAssetName] = useState('');
-  const [newAssetImages, setNewAssetImages] = useState<AssetImage[]>([]);
+  const [directorLog, setDirectorLog] = useState<string[]>([]);
 
-  // 校验失败的视觉高亮状态
-  const [valErrScript, setValErrScript] = useState(false);
-  const [valErrStyle, setValErrStyle] = useState(false);
-
-  const [assetToDelete, setAssetToDelete] = useState<Asset | null>(null);
-
-  const [showTheater, setShowTheater] = useState(false);
+  // Purifier V5.2 - State Management
   const [showPurifier, setShowPurifier] = useState(false);
-  const [purifyQueue, setPurifyQueue] = useState<PurifyItem[]>([]);
-  const [isPurifyingBatch, setIsPurifyingBatch] = useState(false);
-  const [directorLog, setDirectorLog] = useState<string[]>(['[生产枢纽]：Director Core V28.9 视野同步。']);
-
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const assetImageInputRef = useRef<HTMLInputElement>(null);
-  const purifierInputRef = useRef<HTMLInputElement>(null);
+  const [purifyInput, setPurifyInput] = useState<string | null>(null);
+  const [purifyOutput, setPurifyOutput] = useState<string | null>(null);
+  const [isPurifying, setIsPurifying] = useState(false);
+  const [maskVault, setMaskVault] = useState<Record<string, string>>({}); 
+  const [maskHistory, setMaskHistory] = useState<Record<string, string[]>>({}); // Undo system
+  const [compareSplit, setCompareSplit] = useState(50);
+  const [isDraggingPurify, setIsDraggingPurify] = useState(false);
+  const [selectedInMatrix, setSelectedInMatrix] = useState<Set<string>>(new Set());
+  const [processingBatch, setProcessingBatch] = useState<Set<string>>(new Set());
+  
+  // Brush System
+  const [brushSize, setBrushSize] = useState(40);
+  const maskCanvasRef = useRef<HTMLCanvasElement>(null);
+  const [isDrawing, setIsDrawing] = useState(false);
+  const [mousePos, setMousePos] = useState({ x: -100, y: -100 });
 
   useEffect(() => {
     const initApp = async () => {
-      const aistudio = (window as any).aistudio;
-      if (aistudio) setHasApiKey(await aistudio.hasSelectedApiKey());
-      try {
-        const [sAssets, sStyle, sScript, sImages, sShots, sTheme] = await Promise.all([
-          db.get(MASTER_KEYS.ASSETS),
-          db.get(MASTER_KEYS.STYLE),
-          db.get(MASTER_KEYS.SCRIPT),
-          db.get(MASTER_KEYS.IMAGES),
-          db.get(MASTER_KEYS.SHOTS),
-          db.get(MASTER_KEYS.THEME)
-        ]);
-        if (sAssets) setAssets(sAssets);
-        if (sStyle) setStyle(sStyle);
-        if (sScript) setScript(sScript);
-        if (sImages) setImages(sImages);
-        if (sShots) setShots(sShots);
-        if (sTheme) setTheme(sTheme || 'light');
-      } catch (e) { log('❌ 存档读取异常。'); } 
-      finally { setIsLoaded(true); }
+      const [sStyle, sScript, sImages, sShots, sTheme, sMode] = await Promise.all([
+        db.get(MASTER_KEYS.STYLE), db.get(MASTER_KEYS.SCRIPT),
+        db.get(MASTER_KEYS.IMAGES), db.get(MASTER_KEYS.SHOTS), db.get(MASTER_KEYS.THEME),
+        db.get(MASTER_KEYS.MODE)
+      ]);
+      if (sStyle) setStyle(sStyle);
+      if (sScript) setScript(sScript);
+      if (sImages) setImages(sImages);
+      if (sShots) setShots(sShots);
+      if (sTheme) setTheme(sTheme || 'dark');
+      if (sMode) setProductionMode(sMode);
+      setIsLoaded(true);
     };
     initApp();
   }, []);
 
   useEffect(() => {
     if (isLoaded) {
-      db.set(MASTER_KEYS.ASSETS, assets);
       db.set(MASTER_KEYS.STYLE, style);
       db.set(MASTER_KEYS.SCRIPT, script);
       db.set(MASTER_KEYS.IMAGES, images);
       db.set(MASTER_KEYS.SHOTS, shots);
       db.set(MASTER_KEYS.THEME, theme);
+      db.set(MASTER_KEYS.MODE, productionMode);
     }
-  }, [assets, style, script, images, shots, theme, isLoaded]);
+  }, [style, script, images, shots, theme, productionMode, isLoaded]);
 
-  const log = (msg: string) => setDirectorLog(prev => [`[${new Date().toLocaleTimeString()}] ${msg}`, ...prev.slice(0, 19)]);
+  // --- Canvas Core & Undo Logic ---
+  const syncCanvasSize = useCallback(() => {
+    const canvas = maskCanvasRef.current;
+    if (!canvas || !purifyInput) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
 
-  const toggleTheme = () => setTheme(prev => prev === 'light' ? 'dark' : 'light');
-
-  const checkApiKey = async () => {
-    const aistudio = (window as any).aistudio;
-    if (aistudio) {
-      await aistudio.openSelectKey();
-      setHasApiKey(true);
-      return true;
-    }
-    return false;
-  };
-
-  const openAssetEditor = (asset: Asset) => {
-    setNewAssetName(asset.name);
-    setNewAssetImages([...asset.images]);
-    setShowAssetCreator({ type: asset.type, editId: asset.id });
-  };
-
-  const toggleAssetStatus = (id: string) => {
-    setAssets(prev => prev.map(a => a.id === id ? { ...a, isActive: !a.isActive } : a));
-    log(`🔄 资产状态已变更。`);
-  };
-
-  const performDeleteAsset = (id: string) => {
-    setAssets(prev => {
-      const next = prev.filter(a => a.id !== id);
-      log(`🗑️ 资产 "${id}" 已从核心库物理抹除。`);
-      return next;
-    });
-    setAssetToDelete(null);
-    if (showAssetCreator?.editId === id) setShowAssetCreator(null);
-  };
-
-  const handleDragStart = (e: React.DragEvent, id: string) => {
-    setDraggedAssetId(id);
-    e.dataTransfer.effectAllowed = "move";
-    e.dataTransfer.setData("text/plain", id);
-    
-    const ghost = e.currentTarget.cloneNode(true) as HTMLElement;
-    ghost.style.opacity = "0.5";
-    ghost.style.position = "absolute";
-    ghost.style.top = "-1000px";
-    document.body.appendChild(ghost);
-    e.dataTransfer.setDragImage(ghost, 0, 0);
-    setTimeout(() => document.body.removeChild(ghost), 0);
-  };
-
-  const handleDragOver = (e: React.DragEvent, targetId: string) => {
-    e.preventDefault();
-    if (draggedAssetId !== targetId) {
-      setDragOverAssetId(targetId);
-    }
-    e.dataTransfer.dropEffect = "move";
-  };
-
-  const handleDragLeave = (e: React.DragEvent) => {
-    setDragOverAssetId(null);
-  };
-
-  const handleDragEnd = () => {
-    setDraggedAssetId(null);
-    setDragOverAssetId(null);
-  };
-
-  const handleDrop = (e: React.DragEvent, targetId: string) => {
-    e.preventDefault();
-    setDragOverAssetId(null);
-    if (!draggedAssetId || draggedAssetId === targetId) {
-      setDraggedAssetId(null);
-      return;
-    }
-
-    setAssets(prev => {
-      const next = [...prev];
-      const draggedIndex = next.findIndex(a => a.id === draggedAssetId);
-      const targetIndex = next.findIndex(a => a.id === targetId);
-      
-      if (draggedIndex === -1 || targetIndex === -1) return prev;
-
-      const [draggedItem] = next.splice(draggedIndex, 1);
-      next.splice(targetIndex, 0, draggedItem);
-      
-      log(`🎯 资产 "${draggedItem.name}" 位置已重排。`);
-      return next;
-    });
-    setDraggedAssetId(null);
-  };
-
-  const saveAsset = () => {
-    if (!newAssetName || newAssetImages.length === 0) return;
-    if (showAssetCreator?.editId) {
-      setAssets(prev => prev.map(a => a.id === showAssetCreator.editId ? { ...a, name: newAssetName, images: newAssetImages } : a));
-      log(`📝 资产 "${newAssetName}" 配置架构已更新。`);
-    } else {
-      setAssets(prev => [...prev, { id: `asset-${Date.now()}`, name: newAssetName, type: showAssetCreator!.type, images: newAssetImages, isActive: true }]);
-      log(`➕ 资产 "${newAssetName}" 已成功录入。`);
-    }
-    setShowAssetCreator(null);
-    setNewAssetImages([]);
-    setNewAssetName('');
-  };
-
-  const downloadShot = (imageUrl: string, fileName: string) => {
-    const link = document.createElement('a');
-    link.href = imageUrl;
-    link.download = `${fileName}.png`;
-    link.click();
-  };
-
-  const handleDeduct = async () => {
-    // 校验 API Key
-    if (!hasApiKey) { const ok = await checkApiKey(); if (!ok) return; }
-
-    // 严谨的数据检查与引导
-    const isScriptMissing = !script.trim();
-    const isStyleMissing = !style;
-
-    if (isScriptMissing || isStyleMissing) {
-      if (isScriptMissing) {
-        log('⚠️ 生产阻塞：[Scenario Studio] 剧本内容为空。');
-        setValErrScript(true);
-        setTimeout(() => setValErrScript(false), 2000);
-      }
-      if (isStyleMissing) {
-        log('⚠️ 生产阻塞：[Visual DNA] 视觉基因尚未解构。请先在左侧上传参考图并点击“启动视觉解构”。');
-        setValErrStyle(true);
-        setTimeout(() => setValErrStyle(false), 2000);
-      }
-      return;
-    }
-
-    setStatus(AppStatus.DEDUCTING);
-    const placeholders: Shot[] = Array(shotCount).fill(0).map((_, i) => ({
-      id: `placeholder-${Date.now()}-${i}`,
-      name: `Scene 0${i+1}`,
-      composition: 'Rendering',
-      flowLogic: '',
-      chineseDescription: '正在分析导演意图...',
-      englishPrompt: '',
-      dialogue: '',
-      speaker: '',
-      gender: 'narrator',
-      emotion: '',
-      ambientSfx: '',
-      isGenerating: true
-    }));
-    setShots(prev => [...placeholders, ...prev]);
-
-    try { 
-      log(`🎬 启动推演：生产 ${shotCount} 组分镜...`);
-      const newShots = await deductStoryboard(script, style!, shotCount);
-      setShots(prev => {
-        const filtered = prev.filter(s => !s.id.startsWith('placeholder-'));
-        return [...newShots.map(s => ({ ...s, isGenerating: true })), ...filtered];
-      });
-
-      const charAssets = assets.filter(a => a.isActive && a.type === 'character');
-      const sceneAssets = assets.filter(a => a.isActive && a.type === 'scene');
-
-      for (let i = 0; i < newShots.length; i++) {
-        const shot = newShots[i];
-        try {
-          const finalPrompt = shot.englishPrompt + (freePrompt ? `, ${freePrompt}` : '');
-          const url = await renderShot(finalPrompt, style!, aspectRatio, charAssets, sceneAssets);
-          setShots(prev => prev.map(s => s.id === shot.id ? { ...s, imageUrl: url, isGenerating: false } : s));
-          if (i < newShots.length - 1) await new Promise(r => setTimeout(r, 1500));
-        } catch (e: any) { log('⚠️ 渲染引擎繁忙，正在重试。'); }
-      }
-      log('✅ 任务圆满交付。');
-    } catch (e: any) { 
-      log(`❌ 推演异常：${e.message}`);
-      setShots(prev => prev.filter(s => !s.id.startsWith('placeholder-')));
-    } finally { 
-      setStatus(AppStatus.IDLE); 
-    }
-  };
-
-  const handleDistill = async () => {
-    if (images.length === 0) { 
-        log('⚠️ 无法解构：请先在 [Visual DNA] 区域提供 DNA 样本图。'); 
-        setValErrStyle(true);
-        setTimeout(() => setValErrStyle(false), 2000);
-        return; 
-    }
-    setStatus(AppStatus.DISTILLING);
-    try { 
-      const res = await distillStyle(images);
-      setStyle(res); 
-      log('🎨 视觉基因解构成功。'); 
-    } catch (e: any) { log(`❌ 解构异常：${e.message}`); } 
-    finally { setStatus(AppStatus.IDLE); }
-  };
-
-  const handlePurifyBatch = async () => {
-    if (isPurifyingBatch) return;
-    const pending = purifyQueue.filter(i => i.status === 'pending');
-    if (pending.length === 0) return;
-    setIsPurifyingBatch(true);
-    log(`✨ 净化矩阵已上线：正在并发处理 ${pending.length} 个样本...`);
-
-    const processItem = async (item: PurifyItem) => {
-      setPurifyQueue(prev => prev.map(p => p.id === item.id ? { ...p, status: 'working' } : p));
-      try {
-        const result = await removeWatermark(item.input);
-        setPurifyQueue(prev => prev.map(p => p.id === item.id ? { ...p, output: result, status: 'done' } : p));
-      } catch (e) {
-        setPurifyQueue(prev => prev.map(p => p.id === item.id ? { ...p, status: 'error' } : p));
+    const img = new Image();
+    img.onload = () => {
+      canvas.width = img.naturalWidth;
+      canvas.height = img.naturalHeight;
+      const history = maskHistory[purifyInput] || [];
+      if (history.length > 0) {
+        const maskImg = new Image();
+        maskImg.onload = () => ctx.drawImage(maskImg, 0, 0);
+        maskImg.src = history[history.length - 1];
+      } else {
+        ctx.fillStyle = 'black';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
       }
     };
+    img.src = purifyInput;
+  }, [purifyInput, maskHistory]);
 
-    await Promise.all(pending.map(item => processItem(item)));
-    setIsPurifyingBatch(false);
-    log(`✅ 净化队列批处理完毕。`);
+  useEffect(() => {
+    if (showPurifier && purifyInput) syncCanvasSize();
+  }, [purifyInput, showPurifier, syncCanvasSize]);
+
+  // Keyboard Shortcuts
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (!showPurifier) return;
+      if ((e.ctrlKey || e.metaKey) && e.key === 'z') {
+        e.preventDefault();
+        handleUndo();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [showPurifier, purifyInput, maskHistory]);
+
+  const handleUndo = () => {
+    if (!purifyInput) return;
+    const history = maskHistory[purifyInput] || [];
+    if (history.length <= 1) {
+      // If only one (or zero) states, clear to black
+      const ctx = maskCanvasRef.current?.getContext('2d');
+      if (ctx && maskCanvasRef.current) {
+        ctx.fillStyle = 'black';
+        ctx.fillRect(0, 0, maskCanvasRef.current.width, maskCanvasRef.current.height);
+      }
+      setMaskHistory(prev => ({ ...prev, [purifyInput]: [] }));
+    } else {
+      const nextHistory = history.slice(0, -1);
+      const lastState = nextHistory[nextHistory.length - 1];
+      const ctx = maskCanvasRef.current?.getContext('2d');
+      if (ctx && lastState) {
+        const img = new Image();
+        img.onload = () => {
+          ctx.fillStyle = 'black';
+          ctx.fillRect(0, 0, maskCanvasRef.current!.width, maskCanvasRef.current!.height);
+          ctx.drawImage(img, 0, 0);
+        };
+        img.src = lastState;
+      }
+      setMaskHistory(prev => ({ ...prev, [purifyInput]: nextHistory }));
+    }
   };
 
-  const purifyProgress = useMemo(() => {
-    if (purifyQueue.length === 0) return { percent: 0, done: 0, total: 0 };
-    const total = purifyQueue.length;
-    const done = purifyQueue.filter(i => i.status === 'done' || i.status === 'error').length;
-    return { percent: (done / total) * 100, done, total };
-  }, [purifyQueue]);
+  const getEventPos = (e: React.MouseEvent | React.TouchEvent) => {
+    const canvas = maskCanvasRef.current;
+    if (!canvas) return { x: 0, y: 0, viewX: 0, viewY: 0 };
+    const rect = canvas.getBoundingClientRect();
+    const clientX = 'touches' in e ? e.touches[0].clientX : e.clientX;
+    const clientY = 'touches' in e ? e.touches[0].clientY : e.clientY;
 
-  // Derived filtered and sorted assets
-  const getProcessedAssets = (type: 'character' | 'scene') => {
-    return assets
-      .filter(a => a.type === type)
-      .filter(a => {
-        if (filterByStatus === 'active') return a.isActive;
-        if (filterByStatus === 'inactive') return !a.isActive;
-        return true;
-      })
-      .sort((a, b) => {
-        if (sortBy === 'name-asc') return a.name.localeCompare(b.name);
-        if (sortBy === 'name-desc') return b.name.localeCompare(a.name);
-        if (sortBy === 'newest') return parseInt(b.id.split('-')[1]) - parseInt(a.id.split('-')[1]);
-        if (sortBy === 'oldest') return parseInt(a.id.split('-')[1]) - parseInt(b.id.split('-')[1]);
-        if (sortBy === 'status') return (a.isActive === b.isActive) ? 0 : a.isActive ? -1 : 1;
-        return 0;
+    const canvasAspect = canvas.width / canvas.height;
+    const rectAspect = rect.width / rect.height;
+    
+    let actualWidth = rect.width;
+    let actualHeight = rect.height;
+    let offsetX = 0;
+    let offsetY = 0;
+
+    if (rectAspect > canvasAspect) {
+      actualWidth = rect.height * canvasAspect;
+      offsetX = (rect.width - actualWidth) / 2;
+    } else {
+      actualHeight = rect.width / canvasAspect;
+      offsetY = (rect.height - actualHeight) / 2;
+    }
+
+    const x = ((clientX - rect.left - offsetX) / actualWidth) * canvas.width;
+    const y = ((clientY - rect.top - offsetY) / actualHeight) * canvas.height;
+
+    return { x, y, viewX: clientX, viewY: clientY };
+  };
+
+  const startDrawing = (e: React.MouseEvent | React.TouchEvent) => {
+    if (purifyOutput) return;
+    setIsDrawing(true);
+    const { x, y } = getEventPos(e);
+    const ctx = maskCanvasRef.current?.getContext('2d');
+    if (ctx) {
+      ctx.beginPath();
+      ctx.moveTo(x, y);
+    }
+  };
+
+  const draw = (e: React.MouseEvent | React.TouchEvent) => {
+    const pos = getEventPos(e);
+    setMousePos({ x: pos.viewX, y: pos.viewY });
+    if (!isDrawing) return;
+    const ctx = maskCanvasRef.current?.getContext('2d');
+    if (!ctx) return;
+    ctx.lineWidth = brushSize;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = 'white';
+    ctx.lineTo(pos.x, pos.y);
+    ctx.stroke();
+  };
+
+  const stopDrawing = () => {
+    if (isDrawing) {
+      setIsDrawing(false);
+      if (maskCanvasRef.current && purifyInput) {
+        const dataUrl = maskCanvasRef.current.toDataURL();
+        setMaskHistory(prev => ({
+          ...prev,
+          [purifyInput]: [...(prev[purifyInput] || []), dataUrl]
+        }));
+      }
+    }
+  };
+
+  const clearMask = () => {
+    if (!purifyInput) return;
+    const ctx = maskCanvasRef.current?.getContext('2d');
+    if (ctx && maskCanvasRef.current) {
+      ctx.fillStyle = 'black';
+      ctx.fillRect(0, 0, maskCanvasRef.current.width, maskCanvasRef.current.height);
+      setMaskHistory(prev => ({ ...prev, [purifyInput]: [] }));
+    }
+  };
+
+  const toggleSelection = (img: string) => {
+    setSelectedInMatrix(prev => {
+      const next = new Set(prev);
+      if (next.has(img)) next.delete(img);
+      else next.add(img);
+      return next;
+    });
+  };
+
+  const selectAll = () => {
+    if (selectedInMatrix.size === images.length) setSelectedInMatrix(new Set());
+    else setSelectedInMatrix(new Set(images));
+  };
+
+  const handleBatchDrop = async (e: React.DragEvent) => {
+    e.preventDefault(); setIsDraggingPurify(false);
+    if (!e.dataTransfer.files.length) return;
+    
+    const files = (Array.from(e.dataTransfer.files) as File[]).filter(f => f.type.startsWith('image/'));
+    const newImgs: string[] = [];
+    
+    for (const file of files) {
+      const base64 = await new Promise<string>((resolve) => {
+        const reader = new FileReader();
+        reader.onload = (ev) => resolve(ev.target?.result as string);
+        reader.readAsDataURL(file);
       });
+      const compressed = await compressImage(base64);
+      newImgs.push(compressed);
+    }
+
+    setImages(prev => [...newImgs, ...prev]);
+    if (newImgs.length > 0) {
+      setPurifyInput(newImgs[0]);
+      setPurifyOutput(null);
+    }
+    log(`📥 矩阵已同步 ${newImgs.length} 个新样本。`);
   };
 
-  if (!isLoaded) return null;
+  const log = (msg: string) => setDirectorLog(prev => [`[${new Date().toLocaleTimeString()}] ${msg}`, ...prev.slice(0, 15)]);
 
-  const themeClasses = theme === 'dark' ? 'bg-[#050506] text-[#f2f2f7]' : 'bg-[#f4f4f7] text-[#1d1d1f]';
-  const containerClasses = theme === 'dark' ? 'bg-[#0f0f11] border-[#2d2d35] shadow-[0_8px_40px_rgba(0,0,0,0.8)]' : 'bg-white border-[#e2e2e8] shadow-[0_4px_12px_rgba(0,0,0,0.05)]';
-  const headerTextClass = theme === 'dark' ? 'text-blue-400 font-bold' : 'text-blue-600 font-bold';
-  const labelTextClass = theme === 'dark' ? 'text-white/60' : 'text-black/50';
-  const inputBgClass = theme === 'dark' ? 'bg-[#1a1a1e] text-gray-100 border-[#2d2d35]' : 'bg-[#fafafa] text-gray-900 border-[#eef0f2] shadow-inner';
-  const scriptEditorClass = theme === 'dark' ? 'bg-[#0a0a0c] text-gray-100 border-[#2a2a32] focus:border-blue-500/60' : 'bg-white text-gray-900 border-[#d1d5db] focus:border-blue-500/50';
+  const handlePurifyBatch = async () => {
+    const targets: string[] = Array.from(selectedInMatrix);
+    if (targets.length === 0) return;
+    
+    let maskData: string | undefined = undefined;
+    const canvas = maskCanvasRef.current;
+    if (canvas) {
+      const ctx = canvas.getContext('2d');
+      const pixels = ctx?.getImageData(0, 0, canvas.width, canvas.height).data;
+      let hasContent = false;
+      if (pixels) {
+        for (let i = 0; i < pixels.length; i += 4) {
+          if (pixels[i] > 20) { hasContent = true; break; }
+        }
+      }
+      if (hasContent) maskData = canvas.toDataURL('image/jpeg', 0.8);
+    }
+
+    setIsPurifying(true);
+    setProcessingBatch(new Set(targets));
+    log(`🚀 启动批处理，目标: ${targets.length}`);
+
+    const finished = await Promise.all(targets.map(async (img: string) => {
+      try {
+        const res = await removeWatermark(img, maskData);
+        setProcessingBatch(prev => {
+           const next = new Set(prev);
+           next.delete(img);
+           return next;
+        });
+        return res;
+      } catch (err) {
+        console.error(`Failed: ${img.substring(0, 20)}`, err);
+        return null;
+      }
+    }));
+    
+    const successResults = finished.filter((r): r is string => !!r);
+    setImages(prev => [...successResults, ...prev]);
+    setIsPurifying(false);
+    setProcessingBatch(new Set());
+    setSelectedInMatrix(new Set());
+    log(`✅ 批量净化完成: ${successResults.length} 成功。`);
+  };
+
+  const handlePurifySingle = async () => {
+    if (!purifyInput) return;
+    setIsPurifying(true);
+    setPurifyOutput(null);
+    try {
+      const canvas = maskCanvasRef.current;
+      let maskData: string | undefined = undefined;
+      if (canvas) {
+        const ctx = canvas.getContext('2d');
+        const pixels = ctx?.getImageData(0, 0, canvas.width, canvas.height).data;
+        let hasContent = false;
+        if (pixels) {
+          for (let i = 0; i < pixels.length; i += 4) {
+            if (pixels[i] > 20) { hasContent = true; break; }
+          }
+        }
+        if (hasContent) maskData = canvas.toDataURL('image/jpeg', 0.8);
+      }
+      const result = await removeWatermark(purifyInput, maskData);
+      setPurifyOutput(result);
+      log('✨ 单张净化成功。');
+    } catch (e: any) {
+      log(`❌ 净化失败: ${e.message}`);
+    } finally {
+      setIsPurifying(false);
+    }
+  };
+
+  const isDark = theme === 'dark';
+  const glass = isDark ? 'bg-[#121217]/80 backdrop-blur-xl border-white/5' : 'bg-white/80 backdrop-blur-xl border-black/5 shadow-sm';
 
   return (
-    <div className={`flex flex-col h-screen select-none font-sans overflow-hidden transition-colors duration-500 ${themeClasses}`}>
-      <header className={`h-12 flex items-center justify-between px-6 z-50 shrink-0 border-b ${theme === 'dark' ? 'bg-[#0a0a0c] border-white/10' : 'bg-[#1d1d1f] border-black/10'}`}>
+    <div className={`h-screen w-full flex flex-col overflow-hidden transition-colors duration-500 ${isDark ? 'bg-[#0a0a0c] text-white' : 'bg-[#f4f4f7] text-black'}`}>
+      
+      {/* Top Bar */}
+      <header className={`h-16 flex items-center justify-between px-10 border-b ${isDark ? 'border-white/5' : 'border-black/5'}`}>
         <div className="flex items-center gap-4">
-          <div onClick={() => setShowWelcome(true)} className="w-6 h-6 bg-blue-600 rounded-lg flex items-center justify-center font-black text-white text-[9px] cursor-pointer shadow-lg hover:rotate-12 transition-transform">PF</div>
-          <h1 className="text-white font-bold text-[10px] tracking-widest italic opacity-95 uppercase">Director Studio <span className="text-blue-500 ml-1">V28.9</span></h1>
+          <div className="w-10 h-10 bg-blue-600 rounded-xl flex items-center justify-center font-black text-white shadow-lg shadow-blue-600/20">PF</div>
+          <h1 className="font-black text-xs tracking-widest uppercase italic">Director's Studio <span className="text-blue-500 ml-1">V30.0</span></h1>
         </div>
-        <div className="flex items-center gap-3">
-          <button onClick={() => setShowPurifier(true)} className="text-[8px] font-black text-cyan-400 border border-cyan-400/40 px-3 py-1 rounded-full hover:bg-cyan-400/20 transition-all uppercase">✨ 净化矩阵</button>
-          <button onClick={() => setShowTheater(true)} className="text-[8px] font-black text-blue-400 border border-blue-400/40 px-3 py-1 rounded-full hover:bg-blue-400/20 transition-all uppercase">🍿 回放剧场</button>
-          <button onClick={toggleTheme} className={`w-6 h-6 flex items-center justify-center rounded-lg transition-all ${theme === 'dark' ? 'bg-white/10 text-yellow-400' : 'bg-black/5 text-gray-400'}`}>
-            {theme === 'light' ? '🌙' : '☀️'}
+        <div className="flex items-center gap-6">
+          <button onClick={() => setShowPurifier(true)} className="px-6 py-2 bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 rounded-full text-[10px] font-black uppercase hover:bg-cyan-500 hover:text-white transition-all shadow-lg">启动净化矩阵</button>
+          <button onClick={() => setTheme(isDark ? 'light' : 'dark')} className="w-10 h-10 rounded-xl bg-white/5 flex items-center justify-center border border-white/5 text-lg">
+            {isDark ? '☀️' : '🌙'}
           </button>
         </div>
       </header>
 
-      <main className="flex-1 grid grid-cols-1 lg:grid-cols-[230px_1fr_310px] gap-3 p-3 overflow-hidden">
+      {/* Main Studio Grid */}
+      <main className="flex-1 grid grid-cols-1 lg:grid-cols-[300px_1fr_420px] gap-6 p-6 overflow-hidden">
         
-        {/* DNA Section */}
-        <section className={`rounded-[24px] p-4 flex flex-col gap-4 overflow-hidden border transition-all ${containerClasses} ${valErrStyle ? 'ring-2 ring-red-500 ring-inset animate-pulse bg-red-500/5' : ''}`}>
-          <div className="flex justify-between items-center px-1">
-             <h2 className={`text-[10px] font-black italic uppercase tracking-widest ${headerTextClass}`}>Visual DNA</h2>
-             <div className={`w-2 h-2 rounded-full ${style ? 'bg-green-500 shadow-[0_0_12px_rgba(34,197,94,1)]' : 'bg-red-500 shadow-[0_0_12px_rgba(239,68,68,1)] animate-ping'}`}></div>
+        {/* DNA Archive */}
+        <aside className={`rounded-[32px] border p-6 flex flex-col gap-6 overflow-hidden ${glass}`}>
+          <div className="flex justify-between items-center">
+            <span className="text-[10px] font-black uppercase opacity-40 tracking-widest">视觉 DNA 存档</span>
+            <div className={`w-2 h-2 rounded-full ${style ? 'bg-green-500 animate-pulse' : 'bg-red-500'}`}></div>
           </div>
-          <div className="grid grid-cols-3 gap-1.5 overflow-y-auto max-h-[16vh] p-0.5 scrollbar-hide">
-            {images.map((img, i) => (
-              <div key={i} className="relative aspect-square rounded-xl overflow-hidden group border border-current/10 shadow-md">
-                <img src={img} className="w-full h-full object-cover" />
-                <button onClick={() => setImages(prev => prev.filter((_, idx) => idx !== i))} className="absolute top-1 right-1 bg-black/80 text-white rounded-full w-4 h-4 text-[9px] flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">×</button>
-              </div>
-            ))}
-            <button onClick={() => fileInputRef.current?.click()} className={`aspect-square border-2 border-dashed rounded-xl flex items-center justify-center text-sm transition-all ${theme === 'dark' ? 'border-white/20 text-white/20 hover:border-blue-400 hover:text-blue-400' : 'border-gray-200 text-gray-300 hover:border-blue-400 hover:text-blue-400'}`}>+</button>
-            <input type="file" ref={fileInputRef} hidden multiple accept="image/*" onChange={(e) => {
-              if (e.target.files) Array.from(e.target.files).forEach((file: any) => {
-                const reader = new FileReader(); reader.onload = async (ev) => { const comp = await compressImage(ev.target?.result as string); setImages(prev => [...prev, comp]); }; reader.readAsDataURL(file);
-              });
-            }} />
-          </div>
-          <button disabled={status === AppStatus.DISTILLING} onClick={handleDistill} className={`w-full py-2.5 rounded-2xl text-[10px] font-black shadow-xl disabled:opacity-30 uppercase tracking-widest active:scale-95 transition-all hover:brightness-110 ${valErrStyle ? 'bg-red-600' : 'bg-blue-600 text-white'}`}>
-            {status === AppStatus.DISTILLING ? 'Extracting DNA...' : '启动视觉解构'}
-          </button>
-          <div className={`flex-1 rounded-[20px] p-4 overflow-y-auto border scrollbar-hide text-[10px] leading-relaxed font-medium ${inputBgClass}`}>
-            {style ? (
-              <div className="space-y-4">
-                <div className="flex flex-wrap gap-1.5">{style.hexCodes.map((hex, i) => <div key={i} className="w-4 h-4 rounded-md border border-black/10 shadow-sm" style={{ background: hex }}></div>)}</div>
-                <p className="italic opacity-90 leading-relaxed tracking-tight">{style.summary}</p>
-                <div className={`p-2.5 rounded-xl border text-[8px] font-mono opacity-50 leading-tight ${theme === 'dark' ? 'bg-black/50 border-white/10' : 'bg-white border-gray-100'}`}>{style.technicalParams}</div>
-              </div>
-            ) : <p className={`opacity-40 italic text-center mt-10 uppercase tracking-[0.2em] font-black ${labelTextClass} ${valErrStyle ? 'text-red-500 animate-pulse' : ''}`}>DNA Queue Empty</p>}
-          </div>
-        </section>
-
-        {/* Studio Section */}
-        <section className={`rounded-[24px] p-4 flex flex-col gap-4 overflow-hidden border transition-all ${containerClasses}`}>
-          <div className="flex-1 flex flex-col gap-4 overflow-hidden">
-            
-            {/* Scenario Editor */}
-            <div className={`flex-[7] flex flex-col gap-2 min-h-[250px] relative transition-all ${valErrScript ? 'ring-2 ring-red-500 rounded-[22px] bg-red-500/5 animate-pulse' : ''}`}>
-              <div className="flex justify-between items-center px-1">
-                 <span className={`text-[10px] font-black uppercase tracking-[0.3em] italic ${headerTextClass}`}>Scenario Studio</span>
-                 <div className="flex gap-1.5">{[1,2,3].map(i=><div key={i} className="w-1.5 h-1.5 rounded-full bg-blue-500/40"></div>)}</div>
-              </div>
-              <textarea 
-                value={script} 
-                onChange={(e) => setScript(e.target.value)} 
-                placeholder="在此粘贴您的动漫剧本内容..." 
-                className={`flex-1 rounded-[22px] p-6 text-sm outline-none resize-none font-medium transition-all border leading-relaxed shadow-lg ${scriptEditorClass} placeholder:opacity-30 ${valErrScript ? 'border-red-500 focus:border-red-500' : ''}`} 
-              />
-              <div className="absolute bottom-6 right-8 opacity-[0.05] font-black text-3xl italic pointer-events-none tracking-tighter uppercase">Director Mode</div>
-            </div>
-
-            {/* Asset Vault */}
-            <div className={`flex-[3.5] rounded-[22px] p-4 border flex flex-col overflow-hidden min-h-[160px] ${inputBgClass}`}>
-               <div className="flex flex-col gap-3 mb-3 shrink-0">
-                  <div className="flex justify-between items-center px-1">
-                    <div className="flex gap-3 items-center">
-                      <span className={`text-[10px] font-black uppercase tracking-widest italic ${headerTextClass}`}>Asset Vault</span>
-                      <div className="flex gap-2">
-                          <button onMouseDown={(e) => e.stopPropagation()} onClick={() => setShowAssetCreator({type: 'character'})} className="text-[7.5px] font-black text-blue-500 bg-blue-500/15 px-3 py-1 rounded-full hover:bg-blue-500/30 transition-all uppercase">+ 角色</button>
-                          <button onMouseDown={(e) => e.stopPropagation()} onClick={() => setShowAssetCreator({type: 'scene'})} className="text-[7.5px] font-black text-purple-500 bg-purple-500/15 px-3 py-1 rounded-full hover:bg-purple-500/30 transition-all uppercase">+ 场景</button>
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="flex justify-between items-center px-1 py-1.5 border-y border-current/5 gap-4">
-                    <div className="flex items-center gap-2">
-                      <span className="text-[7px] font-black uppercase opacity-40">排序方式:</span>
-                      <select 
-                        value={sortBy} 
-                        onChange={(e) => setSortBy(e.target.value as SortOption)}
-                        className={`text-[8px] font-black bg-transparent outline-none border-none transition-colors cursor-pointer ${theme === 'dark' ? 'text-blue-400' : 'text-blue-600'}`}
-                      >
-                        <option value="newest">最新添加</option>
-                        <option value="oldest">最早添加</option>
-                        <option value="name-asc">名称 (A-Z)</option>
-                        <option value="name-desc">名称 (Z-A)</option>
-                        <option value="status">激活状态</option>
-                      </select>
-                    </div>
-
-                    <div className="flex items-center gap-1.5">
-                      <span className="text-[7px] font-black uppercase opacity-40 mr-1">状态筛选:</span>
-                      {(['all', 'active', 'inactive'] as FilterOption[]).map(f => (
-                        <button 
-                          key={f} 
-                          onClick={() => setFilterByStatus(f)}
-                          className={`text-[7px] font-black uppercase px-2 py-0.5 rounded-md transition-all ${filterByStatus === f ? 'bg-blue-600 text-white shadow-md' : 'opacity-40 hover:opacity-100'}`}
-                        >
-                          {f === 'all' ? '全部' : f === 'active' ? '已激活' : '已停用'}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
+          <div className="grid grid-cols-3 gap-3 overflow-y-auto scrollbar-hide flex-1 max-h-[250px]">
+             {images.map((img, i) => (
+               <div key={i} className="aspect-square relative group rounded-2xl overflow-hidden border border-white/5">
+                 <img src={img} className="w-full h-full object-cover group-hover:scale-110 transition-transform cursor-pointer" />
+                 <button onClick={() => setImages(p => p.filter((_, idx) => idx !== i))} className="absolute top-1 right-1 w-5 h-5 bg-red-500 text-white rounded-full text-[10px] hidden group-hover:flex items-center justify-center">×</button>
                </div>
-
-               <div className="flex-1 overflow-y-auto pr-1 pb-1 scrollbar-hide space-y-5">
-                 {['character', 'scene'].map(type => {
-                   const processedAssets = getProcessedAssets(type as any);
-                   return (
-                     <div key={type}>
-                       <h4 className={`text-[8.5px] font-black uppercase mb-3 tracking-[0.2em] px-1 ${theme === 'dark' ? 'text-white/60' : 'text-black/40'}`}>
-                         {type === 'character' ? '角色资产' : '场景资产'} 
-                         <span className="ml-2 opacity-30 text-[7px]">({processedAssets.length})</span>
-                       </h4>
-                       <div className="grid grid-cols-6 md:grid-cols-9 lg:grid-cols-11 gap-3 px-0.5">
-                         {processedAssets.map(asset => {
-                           const isBeingDragged = draggedAssetId === asset.id;
-                           const isDropTarget = dragOverAssetId === asset.id;
-                           
-                           return (
-                             <div 
-                               key={asset.id} 
-                               draggable="true"
-                               onDragStart={(e) => handleDragStart(e, asset.id)}
-                               onDragOver={(e) => handleDragOver(e, asset.id)}
-                               onDragLeave={handleDragLeave}
-                               onDragEnd={handleDragEnd}
-                               onDrop={(e) => handleDrop(e, asset.id)}
-                               className={`group relative p-0.5 rounded-xl border transition-all duration-300 cursor-grab active:cursor-grabbing 
-                                 ${isBeingDragged ? 'opacity-30 border-blue-500 scale-95' : 'opacity-100'} 
-                                 ${isDropTarget ? 'border-cyan-400 border-2 scale-105 shadow-[0_0_15px_rgba(34,211,238,0.5)] z-20' : ''}
-                                 ${!isBeingDragged && !isDropTarget ? (asset.isActive ? (type === 'character' ? 'border-blue-500/70 bg-blue-500/10' : 'border-purple-500/70 bg-purple-500/10') : 'border-transparent bg-black/20 opacity-60 grayscale') : ''}`}
-                             >
-                               <img src={asset.images.find(i=>i.isActive)?.url || asset.images[0]?.url} className="aspect-square rounded-lg object-cover mb-1 shadow-md pointer-events-none" />
-                               <p className={`text-[7px] font-black truncate text-center uppercase tracking-tight pointer-events-none ${theme === 'dark' ? 'text-gray-300' : 'text-gray-700'}`}>{asset.name}</p>
-                               
-                               <div className="absolute inset-0 bg-black/95 backdrop-blur-[3px] rounded-xl flex flex-col items-center justify-center gap-1.5 opacity-0 group-hover:opacity-100 transition-all z-[100] p-1.5">
-                                  <button onMouseDown={(e) => e.stopPropagation()} onClick={(e) => { e.stopPropagation(); openAssetEditor(asset); }} className="w-full py-1.5 text-[8.5px] font-black uppercase rounded-lg text-white bg-blue-600 hover:bg-blue-500 transition-colors shadow-lg">修改</button>
-                                  <button onMouseDown={(e) => e.stopPropagation()} onClick={(e) => { e.stopPropagation(); toggleAssetStatus(asset.id); }} className={`w-full py-1.5 text-[8.5px] font-black uppercase rounded-lg border transition-colors ${asset.isActive ? 'text-orange-400 border-orange-400/40 bg-orange-400/5 hover:bg-orange-400/20' : 'text-green-400 border-green-400/40 bg-green-400/5 hover:bg-green-400/20'}`}>
-                                    {asset.isActive ? '停用' : '激活'}
-                                  </button>
-                                  <button onMouseDown={(e) => e.stopPropagation()} onClick={(e) => { e.stopPropagation(); setAssetToDelete(asset); }} className="w-full py-1.5 text-[8.5px] font-black uppercase rounded-lg text-red-500 border border-red-500/30 bg-red-500/5 hover:bg-red-500/20 transition-colors">删除</button>
-                               </div>
-                               {isDropTarget && (
-                                 <div className="absolute -inset-1 border-2 border-cyan-400 border-dashed rounded-2xl pointer-events-none animate-pulse"></div>
-                               )}
-                             </div>
-                           );
-                         })}
-                       </div>
-                       {processedAssets.length === 0 && (
-                         <div className="text-[7px] italic opacity-20 uppercase px-1 py-2">未找到匹配的{type === 'character' ? '角色' : '场景'}</div>
-                       )}
-                     </div>
-                   );
-                 })}
-                 {assets.length === 0 && <div className="text-[10px] text-center opacity-10 uppercase font-black py-8 tracking-widest italic">库中空空如也</div>}
-               </div>
-            </div>
-
-            <div className={`h-12 rounded-[16px] p-2.5 font-mono text-[9px] overflow-y-auto scrollbar-hide border ${theme === 'dark' ? 'bg-[#000] text-blue-400/90 border-white/5' : 'bg-gray-900 text-green-400/90 border-black/5'}`}>
-              {directorLog.map((l, i) => <div key={i} className="mb-1 opacity-95 text-xs">{l}</div>)}
-            </div>
-            
-            <div className="flex gap-3 items-center">
-              <div className={`flex rounded-2xl p-1 border transition-all overflow-x-auto scrollbar-hide ${theme === 'dark' ? 'bg-[#1a1a1e] border-white/10 shadow-inner' : 'bg-gray-200/50 border-gray-200 shadow-inner'}`}>
-                {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map(n => (
-                  <button key={n} onClick={() => setShotCount(n)} className={`px-3 py-2 rounded-xl text-[10px] font-black transition-all min-w-[36px] ${shotCount === n ? 'bg-blue-600 text-white shadow-xl' : 'text-current opacity-40 hover:opacity-100'}`}>
-                    {n}
-                  </button>
-                ))}
-              </div>
-              <button disabled={status === AppStatus.DEDUCTING} onClick={handleDeduct} className={`flex-1 bg-blue-600 text-white py-4 rounded-2xl text-[11px] font-black shadow-2xl transition-all uppercase tracking-[0.3em] active:scale-95 hover:brightness-110 shadow-blue-500/30`}>
-                {status === AppStatus.DEDUCTING ? 'Processing Pipeline...' : '启动分镜推演'}
-              </button>
-            </div>
+             ))}
+             <div className="aspect-square border-2 border-dashed border-current opacity-20 rounded-2xl flex items-center justify-center text-3xl hover:opacity-100 transition-all cursor-pointer">+</div>
           </div>
-        </section>
+          <button onClick={async () => {
+             setStatus(AppStatus.DISTILLING);
+             try { setStyle(await distillStyle(images)); log('🎨 风格解析完成。'); } finally { setStatus(AppStatus.IDLE); }
+          }} className="w-full py-4 bg-blue-600 rounded-2xl text-[10px] font-black uppercase tracking-widest text-white hover:brightness-110 shadow-xl shadow-blue-600/20">提取核心视觉</button>
+          <div className="flex-1 rounded-3xl bg-black/20 p-6 border border-white/5 overflow-y-auto scrollbar-hide">
+             {style ? <p className="text-xs leading-relaxed opacity-80 italic">{style.summary}</p> : <div className="h-full flex items-center justify-center opacity-10 text-[10px] uppercase font-black tracking-[0.3em]">待机中</div>}
+          </div>
+        </aside>
 
-        {/* Output Section */}
-        <section className={`rounded-[24px] p-4 flex flex-col gap-4 overflow-hidden border transition-all ${containerClasses}`}>
-          <div className="flex justify-between items-center px-1">
-            <h2 className={`text-[10px] font-black italic uppercase tracking-widest ${headerTextClass}`}>Output Terminal</h2>
-            <div className="flex gap-2">
-                <select value={aspectRatio} onChange={(e) => setAspectRatio(e.target.value)} className={`text-[8px] font-black px-2 py-1 rounded-lg outline-none border transition-all ${theme === 'dark' ? 'bg-[#1a1a1e] text-white border-white/20' : 'bg-white text-gray-700 border-gray-200 shadow-sm'}`}>
-                    <option value="16:9">16:9</option>
-                    <option value="9:16">9:16</option>
-                    <option value="1:1">1:1</option>
-                    <option value="4:3">4:3</option>
+        {/* Script Console */}
+        <section className={`rounded-[40px] border p-8 flex flex-col gap-6 overflow-hidden ${glass}`}>
+           <textarea value={script} onChange={(e) => setScript(e.target.value)} placeholder="在此撰写你的剧本描述..." className="flex-1 bg-transparent border-none outline-none resize-none text-lg font-medium leading-loose placeholder:opacity-20" />
+           <div className="h-16 flex items-center justify-between px-6 bg-black/20 rounded-3xl border border-white/5">
+              <div className="flex items-center gap-4">
+                <select value={aspectRatio} onChange={(e) => setAspectRatio(e.target.value)} className="bg-transparent text-[10px] font-black uppercase border-none outline-none">
+                  <option value="16:9">16:9</option>
+                  <option value="9:16">9:16</option>
+                  <option value="1:1">1:1</option>
                 </select>
-                <button onClick={() => setShots([])} className="text-[8px] font-black text-red-500 bg-red-500/10 px-2.5 py-1 rounded-lg transition-all uppercase hover:bg-red-500/20 border border-red-500/20">Clear</button>
-            </div>
-          </div>
-          <div className="flex-1 overflow-y-auto space-y-5 pr-1 scrollbar-hide pb-10">
-            {shots.length === 0 && (
-                <div className="h-full flex flex-col items-center justify-center opacity-10 italic">
-                    <span className="text-4xl mb-4">🎬</span>
-                    <p className="text-[10px] font-black uppercase tracking-[0.4em]">Awaiting Production</p>
+                <div className="w-px h-4 bg-white/10"></div>
+                <div className="flex gap-2">
+                  {[1, 2, 4].map(n => <button key={n} onClick={() => setShotCount(n)} className={`w-8 h-8 rounded-lg text-[10px] font-black transition-all ${shotCount === n ? 'bg-blue-600 text-white' : 'opacity-20 hover:opacity-100'}`}>{n}</button>)}
                 </div>
-            )}
-            {shots.map((shot) => (
-              <div key={shot.id} className={`rounded-[20px] p-4.5 border transition-all group/shot ${theme === 'dark' ? 'bg-[#16161a] border-white/10 shadow-2xl' : 'bg-[#fafafa] border-gray-200 shadow-sm'} ${shot.id.startsWith('placeholder-') ? 'animate-pulse opacity-50' : ''}`}>
-                <div className="flex justify-between items-center mb-2.5">
-                  <span className={`font-black text-[9px] uppercase tracking-[0.3em] ${theme === 'dark' ? 'text-white/60' : 'text-black/40'}`}>{shot.name}</span>
-                  {!shot.id.startsWith('placeholder-') && (
-                    <div className="flex gap-2.5 opacity-0 group-hover/shot:opacity-100 transition-all">
-                      <button onClick={() => { if(shot.imageUrl) downloadShot(shot.imageUrl, shot.name); }} className="text-blue-500 hover:text-blue-400 text-[9px] font-black uppercase">保存</button>
-                      <button onClick={() => { if(shot.imageUrl) { setPurifyQueue(prev => [...prev, { id: `pur-${Date.now()}`, input: shot.imageUrl!, status: 'pending' }]); setShowPurifier(true); } }} className="text-cyan-500 hover:text-cyan-400 text-[9px] font-black uppercase">✨ 净化</button>
-                      <button onClick={() => { setShots(prev => prev.filter(s => s.id !== shot.id)); }} className="text-red-400 text-xs">×</button>
-                    </div>
-                  )}
+              </div>
+              <button onClick={async () => {
+                if (!style || !script) return;
+                setStatus(AppStatus.DEDUCTING);
+                try {
+                  const newShots = await deductStoryboard(script, style, shotCount, productionMode);
+                  setShots(p => [...newShots.map(s => ({ ...s, isGenerating: true })), ...p]);
+                  for (const s of newShots) {
+                    const url = await renderShot(s.englishPrompt, style, aspectRatio, [], [], productionMode);
+                    setShots(p => p.map(it => it.id === s.id ? { ...it, imageUrl: url, isGenerating: false } : it));
+                  }
+                } finally { setStatus(AppStatus.IDLE); }
+              }} className="px-10 py-3 bg-white text-black rounded-2xl text-[10px] font-black uppercase tracking-widest hover:bg-blue-600 hover:text-white transition-all shadow-lg">生成分镜</button>
+           </div>
+        </section>
+
+        {/* Live Monitor */}
+        <aside className={`rounded-[32px] border p-6 flex flex-col gap-6 overflow-hidden ${glass}`}>
+          <span className="text-[10px] font-black uppercase opacity-40 tracking-widest">分镜监控流</span>
+          <div className="flex-1 overflow-y-auto space-y-6 pr-2 scrollbar-hide pb-20">
+            {shots.map(shot => (
+              <div key={shot.id} className="p-4 rounded-3xl bg-white/[0.02] border border-white/5 group">
+                <div className="aspect-video bg-black rounded-2xl overflow-hidden mb-4 relative shadow-2xl">
+                  {shot.imageUrl ? <img src={shot.imageUrl} className="w-full h-full object-cover" /> : <div className="absolute inset-0 flex items-center justify-center animate-pulse opacity-20 text-[10px] font-black uppercase">绘制中...</div>}
                 </div>
-                <p className={`text-[11px] mb-4 leading-relaxed font-bold italic tracking-tight ${theme === 'dark' ? 'text-white/95' : 'text-gray-800'}`}>{shot.chineseDescription}</p>
-                <div className={`relative rounded-2xl overflow-hidden aspect-video border shadow-inner ${theme === 'dark' ? 'bg-black border-white/10' : 'bg-zinc-100 border-gray-200'}`}>
-                  {shot.imageUrl ? (
-                    <img src={shot.imageUrl} className="w-full h-full object-cover" />
-                  ) : (
-                    <div className="w-full h-full flex flex-col items-center justify-center animate-pulse gap-3 text-blue-600/40">
-                      <div className="w-5 h-5 border-2 border-blue-600/20 border-t-blue-600 rounded-full animate-spin"></div>
-                      <span className="text-[8px] font-black uppercase tracking-[0.4em] italic">Rendering Frame</span>
-                    </div>
-                  )}
-                </div>
+                <p className="text-[11px] leading-relaxed opacity-70 italic line-clamp-2">{shot.chineseDescription}</p>
               </div>
             ))}
           </div>
-        </section>
+        </aside>
       </main>
 
-      {/* 资产物理删除确认矩阵 - 自定义模态框 */}
-      {assetToDelete && (
-        <div className="fixed inset-0 bg-black/98 backdrop-blur-3xl z-[10000] flex items-center justify-center p-6 animate-in fade-in duration-300">
-           <div className={`rounded-[32px] w-full max-w-md p-10 shadow-2xl border-2 flex flex-col items-center text-center transition-all ${theme === 'dark' ? 'bg-[#1a0a0a] border-red-500/50 shadow-red-500/20' : 'bg-white border-red-200 shadow-xl'}`}>
-              <div className="w-20 h-20 rounded-full bg-red-600/10 flex items-center justify-center mb-6 border border-red-500/30">
-                <span className="text-red-500 text-4xl animate-pulse">⚠️</span>
+      {/* 净化矩阵 V5.2 - Matrix System */}
+      {showPurifier && (
+        <div className="fixed inset-0 z-[1000] bg-[#020205] text-white flex flex-col animate-in fade-in overflow-hidden">
+           {/* Matrix Header */}
+           <div className="h-20 px-12 flex items-center justify-between border-b border-white/10 shrink-0 bg-black/40 backdrop-blur-2xl">
+              <div className="flex flex-col">
+                <h3 className="text-2xl font-black italic text-cyan-400 flex items-center gap-3">
+                  <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse"></span>
+                  净化矩阵 V5.2
+                </h3>
+                <span className="text-[8px] opacity-30 uppercase font-black tracking-widest italic">INTUITIVE RESTORATION / DUAL DOMAIN INTERFACE</span>
               </div>
-              <h3 className="text-2xl font-black italic uppercase tracking-tighter text-red-500 mb-4">资产物理清除警告</h3>
-              <p className={`text-[11px] font-bold uppercase tracking-widest leading-relaxed mb-8 opacity-70 ${theme === 'dark' ? 'text-white' : 'text-black'}`}>
-                您正准备永久销毁资产 <span className="text-red-500 underline font-black">"{assetToDelete.name}"</span>。<br/>此操作将不可逆转地抹除其在核心库及本地 DNA 链中的所有记录。
-              </p>
-              
-              <div className="flex gap-4 w-full">
-                <button onClick={() => setAssetToDelete(null)} className={`flex-1 py-4 rounded-2xl text-[10px] font-black uppercase tracking-widest border transition-all ${theme === 'dark' ? 'border-white/10 text-white/50 hover:bg-white/5' : 'border-black/5 text-black/40 hover:bg-gray-50'}`}>中止清除</button>
-                <button onClick={() => performDeleteAsset(assetToDelete.id)} className="flex-1 bg-red-600 text-white py-4 rounded-2xl text-[10px] font-black uppercase tracking-widest shadow-2xl shadow-red-500/30 hover:bg-red-500 transition-all active:scale-95">执行物理抹除</button>
+              <div className="flex items-center gap-10">
+                 <div className="flex bg-white/5 p-1 rounded-xl">
+                    <button onClick={selectAll} className="px-4 py-2 text-[10px] font-black uppercase hover:text-cyan-400 transition-colors">样本全选</button>
+                 </div>
+                 <button onClick={() => setShowPurifier(false)} className="w-12 h-12 flex items-center justify-center rounded-full bg-white/5 hover:bg-red-500/20 hover:rotate-90 transition-all text-2xl font-light">×</button>
               </div>
-              
-              <div className="mt-8 pt-4 border-t border-red-500/10 w-full">
-                <p className="text-[7px] text-red-500/40 uppercase font-mono tracking-tighter animate-pulse">[PROTOCOL 00: DATA PURGE INITIATED]</p>
+           </div>
+
+           <div className="flex-1 flex overflow-hidden">
+              {/* Batch Sidebar */}
+              <aside className="w-[300px] border-r border-white/10 bg-black/60 flex flex-col p-8 overflow-hidden">
+                 <span className="text-[10px] font-black uppercase text-white/30 tracking-widest mb-6">样本序列 ({images.length})</span>
+                 <div className="flex-1 overflow-y-auto space-y-4 pr-3 scrollbar-hide">
+                    {images.map((img, idx) => (
+                      <div key={idx} className="relative group">
+                        <div onClick={() => { setPurifyInput(img); setPurifyOutput(null); }} className={`relative aspect-video rounded-xl overflow-hidden cursor-pointer transition-all border-2 ${purifyInput === img ? 'border-cyan-500 scale-95 shadow-2xl shadow-cyan-500/40' : 'border-transparent opacity-30 hover:opacity-100'}`}>
+                          <img src={img} className="w-full h-full object-cover" />
+                          {processingBatch.has(img) && (
+                            <div className="absolute inset-0 bg-black/60 flex items-center justify-center">
+                              <div className="w-6 h-6 border-2 border-t-cyan-400 border-white/10 rounded-full animate-spin"></div>
+                            </div>
+                          )}
+                        </div>
+                        <input 
+                          type="checkbox" 
+                          checked={selectedInMatrix.has(img)}
+                          onChange={() => toggleSelection(img)}
+                          className="absolute top-2 left-2 w-4 h-4 accent-cyan-400 cursor-pointer rounded"
+                        />
+                      </div>
+                    ))}
+                 </div>
+              </aside>
+
+              {/* Central Workspace */}
+              <div className="flex-1 flex flex-col bg-[#050508] p-10 overflow-hidden">
+                 <div className="flex-1 flex gap-8 overflow-hidden">
+                    
+                    {/* Input Domain (Science Blue) */}
+                    <div className="flex-1 flex flex-col gap-4 relative group">
+                       <div className="absolute top-8 left-1/2 -translate-x-1/2 z-10 px-4 py-1.5 bg-cyan-600/90 rounded-full text-[9px] font-black uppercase tracking-widest shadow-2xl">原始样本 / Before</div>
+                       <div className={`flex-1 rounded-[40px] border-2 transition-all duration-500 overflow-hidden relative shadow-2xl ${isDrawing ? 'border-cyan-400/60 bg-cyan-400/5' : 'border-cyan-500/20 bg-black'}`}>
+                          {purifyInput ? (
+                            <div className="w-full h-full flex items-center justify-center p-4 relative">
+                               <div className="relative inline-block max-w-full max-h-full rounded-xl overflow-hidden">
+                                  <img src={purifyInput} className="max-w-full max-h-full object-contain block opacity-80" />
+                                  <canvas 
+                                    ref={maskCanvasRef} 
+                                    onMouseDown={startDrawing} onMouseMove={draw} onMouseUp={stopDrawing} onMouseLeave={stopDrawing}
+                                    className="absolute inset-0 w-full h-full opacity-60 mix-blend-screen cursor-none"
+                                    style={{ display: purifyOutput ? 'none' : 'block' }}
+                                  />
+                                  <div className="fixed pointer-events-none rounded-full border border-cyan-400 mix-blend-difference z-[2000] shadow-[0_0_15px_rgba(34,211,238,0.5)]" style={{ width: brushSize, height: brushSize, left: mousePos.x - brushSize/2, top: mousePos.y - brushSize/2 }}>
+                                    <div className="absolute inset-0 rounded-full border border-white/20 animate-ping opacity-20"></div>
+                                  </div>
+                               </div>
+                            </div>
+                          ) : <div className="h-full flex items-center justify-center opacity-10 uppercase text-[10px] font-black tracking-widest">待入库图片样本</div>}
+                       </div>
+                       
+                       {/* Control Bar */}
+                       <div className="flex items-center justify-between px-6 py-4 bg-white/5 rounded-3xl border border-white/5">
+                          <div className="flex items-center gap-6">
+                             <button onClick={handleUndo} title="撤销 (Ctrl+Z)" className="w-10 h-10 flex items-center justify-center rounded-xl bg-white/5 hover:bg-cyan-500/20 transition-all text-lg">↩️</button>
+                             <button onClick={clearMask} title="清空所有涂鸦" className="w-10 h-10 flex items-center justify-center rounded-xl bg-white/5 hover:bg-red-500/20 transition-all text-lg">🗑️</button>
+                             <div className="w-px h-6 bg-white/10 mx-2"></div>
+                             <div className="flex flex-col gap-1 w-32">
+                                <span className="text-[8px] font-black opacity-30 uppercase">笔触大小: {brushSize}px</span>
+                                <input type="range" min="5" max="200" value={brushSize} onChange={e => setBrushSize(parseInt(e.target.value))} className="accent-cyan-400" />
+                             </div>
+                          </div>
+                          <button 
+                            disabled={!purifyInput || isPurifying} 
+                            onClick={handlePurifySingle} 
+                            className={`px-8 py-3 rounded-2xl font-black text-[10px] uppercase tracking-widest transition-all ${!purifyInput || isPurifying ? 'bg-white/5 opacity-10' : 'bg-cyan-500 hover:scale-105 active:scale-95 shadow-xl shadow-cyan-500/30'}`}
+                          >
+                             {isPurifying ? '重建中...' : '启动净化'}
+                          </button>
+                       </div>
+                    </div>
+
+                    {/* Bridge (Batch Processor) */}
+                    <div className="w-16 flex flex-col items-center justify-center gap-6">
+                        <button 
+                          disabled={selectedInMatrix.size === 0 || isPurifying} 
+                          onClick={handlePurifyBatch}
+                          className={`w-14 h-14 rounded-2xl flex items-center justify-center text-xl transition-all ${selectedInMatrix.size === 0 || isPurifying ? 'bg-white/5 opacity-10' : 'bg-blue-600 hover:scale-110'}`}
+                        >
+                          🌪️
+                        </button>
+                        <div className="w-px h-10 bg-white/10"></div>
+                        <span className="text-[7px] font-black uppercase text-center opacity-30 tracking-widest">批量<br/>模式</span>
+                    </div>
+
+                    {/* Output Domain (Flowing Green) */}
+                    <div className="flex-1 flex flex-col gap-4 relative">
+                       <div className="absolute top-8 left-1/2 -translate-x-1/2 z-10 px-4 py-1.5 bg-emerald-600/90 rounded-full text-[9px] font-black uppercase tracking-widest shadow-2xl">净化结果 / After</div>
+                       <div className={`flex-1 rounded-[40px] border-2 transition-all duration-700 relative overflow-hidden flex items-center justify-center p-4 bg-[#020205] ${purifyOutput ? 'border-emerald-500/50 shadow-[0_0_50px_rgba(16,185,129,0.15)]' : 'border-white/5'}`}>
+                          {purifyOutput ? (
+                            <div className="relative w-full h-full flex items-center justify-center rounded-2xl overflow-hidden group">
+                               <img src={purifyInput!} className="max-w-full max-h-full object-contain opacity-20" />
+                               <div className="absolute inset-0 pointer-events-none" style={{ clipPath: `inset(0 ${100 - compareSplit}% 0 0)` }}>
+                                  <img src={purifyOutput} className="w-full h-full object-contain" />
+                               </div>
+                               <div className="absolute inset-0 cursor-ew-resize">
+                                  <div className="absolute top-0 bottom-0 w-[2px] bg-emerald-400 shadow-[0_0_15px_rgba(52,211,153,0.8)]" style={{ left: `${compareSplit}%` }}>
+                                     <div className="absolute top-1/2 -left-6 w-12 h-12 rounded-full bg-[#10b981] border-4 border-[#050508] flex items-center justify-center text-white font-black shadow-2xl group-hover:scale-110 transition-transform">↔</div>
+                                  </div>
+                                  <input type="range" min="0" max="100" value={compareSplit} onChange={e => setCompareSplit(parseInt(e.target.value))} className="absolute inset-0 opacity-0 cursor-ew-resize" />
+                               </div>
+                            </div>
+                          ) : isPurifying ? (
+                            <div className="flex flex-col items-center gap-6">
+                              <div className="w-16 h-16 border-4 border-emerald-500/10 border-t-emerald-500 rounded-full animate-spin" />
+                              <p className="text-[10px] font-black uppercase text-emerald-500 animate-pulse tracking-widest">正在进行分子级像素重建...</p>
+                            </div>
+                          ) : <div className="text-center opacity-5 uppercase font-black text-[12px] tracking-[0.4em]">能量场就绪</div>}
+                       </div>
+
+                       {/* Action Bar */}
+                       <div className="flex items-center justify-center gap-4 py-4 px-6 bg-white/5 rounded-3xl border border-white/5">
+                          {purifyOutput ? (
+                             <>
+                               <button onClick={() => { setImages(p => [purifyOutput, ...p]); setPurifyOutput(null); log('✅ 净化样本已成功持久化。'); }} className="px-10 h-12 rounded-xl bg-emerald-600 text-white font-black text-[9px] uppercase tracking-widest hover:brightness-110">保存并持久化</button>
+                               <button onClick={() => { setPurifyInput(purifyOutput); setPurifyOutput(null); log('🔄 结果回传，开始二次净化。'); }} className="px-6 h-12 rounded-xl bg-white/5 border border-white/10 text-[9px] font-black uppercase hover:bg-white/10">回传二次处理</button>
+                             </>
+                          ) : <span className="text-[9px] font-black uppercase opacity-20 tracking-widest">等待数据流输出</span>}
+                       </div>
+                    </div>
+                 </div>
               </div>
            </div>
         </div>
       )}
 
-      {/* Asset Creator / Editor Modal */}
-      {showAssetCreator && (
-        <div className="fixed inset-0 bg-black/98 backdrop-blur-3xl z-[6000] flex items-center justify-center p-6 animate-in fade-in duration-300">
-          <div className={`rounded-[32px] w-full max-w-2xl p-10 shadow-2xl transition-all border flex flex-col max-h-[90vh] ${theme === 'dark' ? 'bg-[#151518] border-white/20' : 'bg-white border-black/10'}`}>
-            <div className="flex justify-between items-center mb-10 shrink-0">
-              <h3 className={`text-2xl font-black italic uppercase tracking-tighter ${theme === 'dark' ? 'text-white' : 'text-black'}`}>
-                {showAssetCreator.editId ? '资产配置重组' : `录入新${showAssetCreator.type === 'character' ? '角色' : '场景'}`}
-              </h3>
-              <button onClick={() => setShowAssetCreator(null)} className="text-3xl font-light hover:rotate-90 transition-transform opacity-60 hover:opacity-100">×</button>
-            </div>
-            
-            <div className="flex-1 overflow-y-auto pr-4 scrollbar-hide space-y-10 pb-6">
-              <div>
-                <label className={`text-[9px] font-black uppercase block mb-3 px-1 tracking-widest ${theme === 'dark' ? 'text-white/60' : 'text-black/40'}`}>资产代号 (ID)</label>
-                <input value={newAssetName} onChange={(e) => setNewAssetName(e.target.value)} placeholder="输入名称标识..." className={`w-full px-6 py-5 rounded-2xl border outline-none font-bold text-base ${inputBgClass} placeholder:opacity-20`} />
-              </div>
-              
-              <div>
-                <label className={`text-[9px] font-black uppercase block mb-4 px-1 tracking-widest ${theme === 'dark' ? 'text-white/60' : 'text-black/40'}`}>视觉基因组 (Photo Management)</label>
-                <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-6 mb-5">
-                  {newAssetImages.map((img, i) => (
-                    <div key={i} className={`group aspect-square rounded-2xl overflow-hidden border-2 relative shadow-xl transition-all ${img.isActive ? 'border-blue-500/70' : 'border-red-500/50 grayscale opacity-40'}`}>
-                      <img src={img.url} className="w-full h-full object-cover" />
-                      <div className="absolute inset-0 bg-black/95 flex flex-col items-center justify-center gap-2.5 opacity-0 group-hover:opacity-100 transition-opacity p-3">
-                         <button onClick={() => setNewAssetImages(prev => prev.map((item, idx) => idx === i ? { ...item, isActive: !item.isActive } : item))} className={`w-full py-2.5 rounded-xl text-[9px] font-black uppercase transition-colors shadow-lg ${img.isActive ? 'bg-orange-600 text-white' : 'bg-green-600 text-white'}`}>
-                           {img.isActive ? '停用此图' : '启用此图'}
-                         </button>
-                         <button onClick={() => setNewAssetImages(prev => prev.filter((_, idx) => idx !== i))} className="w-full py-2.5 rounded-xl text-[9px] font-black uppercase bg-red-600 text-white hover:bg-red-700 transition-colors shadow-lg">彻底删除此图</button>
-                      </div>
-                    </div>
-                  ))}
-                  <button onClick={() => assetImageInputRef.current?.click()} className={`aspect-square border-2 border-dashed rounded-2xl flex flex-col items-center justify-center transition-all ${theme === 'dark' ? 'border-white/20 text-white/20 hover:border-blue-500/70 hover:text-blue-400' : 'border-gray-200 text-gray-300 hover:border-blue-400 hover:text-blue-400'}`}>
-                    <span className="text-4xl mb-1.5">+</span>
-                    <span className="text-[9px] uppercase font-black tracking-widest">追加基因样本</span>
-                  </button>
-                  <input type="file" ref={assetImageInputRef} hidden multiple accept="image/*" onChange={(e) => { 
-                    if (e.target.files) Array.from(e.target.files).forEach((file: any) => { 
-                      const reader = new FileReader(); 
-                      reader.onload = async (ev) => { 
-                        const comp = await compressImage(ev.target?.result as string, 512, 0.5); 
-                        setNewAssetImages(prev => [...prev, { url: comp, isActive: true }]); 
-                      }; 
-                      reader.readAsDataURL(file); 
-                    }); 
-                  }} />
-                </div>
-              </div>
-
-              {showAssetCreator.editId && (
-                <div className={`p-6 rounded-3xl border border-red-500/20 bg-red-500/5 mt-10 transition-all hover:bg-red-500/10`}>
-                   <div className="flex justify-between items-center">
-                      <div>
-                        <h4 className="text-[10px] font-black text-red-500 uppercase tracking-widest mb-1">危险区域</h4>
-                        <p className="text-[8px] text-red-400 opacity-60 uppercase">彻底移除此资产及其所有视觉基因</p>
-                      </div>
-                      <button onClick={() => setAssetToDelete(assets.find(a => a.id === showAssetCreator.editId!) || null)} className="bg-red-600 text-white px-6 py-2 rounded-xl text-[10px] font-black uppercase hover:bg-red-700 active:scale-95 transition-all shadow-xl">销毁资产</button>
-                   </div>
-                </div>
-              )}
-            </div>
-
-            <div className="flex gap-5 pt-10 border-t border-current/10 shrink-0">
-              <button onClick={() => { setShowAssetCreator(null); setNewAssetImages([]); setNewAssetName(''); }} className={`flex-1 py-5 text-[11px] font-black uppercase tracking-widest transition-opacity ${theme === 'dark' ? 'text-white/60' : 'text-black/40'} hover:opacity-100`}>放弃更改</button>
-              <button onClick={saveAsset} className="flex-[2] bg-blue-600 text-white py-5 rounded-2xl text-[11px] font-black uppercase shadow-2xl shadow-blue-500/40 active:scale-95 transition-all hover:brightness-110">确认并同步库</button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Purification Matrix Modal */}
-      {showPurifier && (
-        <div className={`fixed inset-0 z-[10000] flex flex-col p-10 animate-in fade-in transition-all ${theme === 'dark' ? 'bg-[#050506] text-[#f0f0f7]' : 'bg-white text-gray-900'}`}>
-           <div className={`h-16 flex items-center justify-between px-2 border-b transition-colors shrink-0 ${theme === 'dark' ? 'border-white/20' : 'border-black/5'}`}>
-             <h3 className="text-2xl font-black italic uppercase tracking-tighter">Purification Matrix / 净化引擎</h3>
-             <button onClick={() => setShowPurifier(false)} className="text-4xl font-light hover:rotate-90 transition-transform opacity-60">×</button>
-          </div>
-          <div className="flex-1 flex gap-10 overflow-hidden mt-10">
-             <div className="w-72 flex flex-col gap-8">
-                <div className={`p-6 rounded-[32px] border flex flex-col gap-3 transition-all ${theme === 'dark' ? 'bg-[#1a1a1e] border-white/20' : 'bg-gray-50 border-gray-200'}`}>
-                   <div className="flex justify-between items-center px-1">
-                      <span className={`text-[9px] font-black uppercase tracking-widest ${theme === 'dark' ? 'text-white/50' : 'text-black/30'}`}>Batch Progress</span>
-                      <span className="text-[10px] font-black text-cyan-500">{purifyProgress.done}/{purifyProgress.total}</span>
-                   </div>
-                   <div className="h-2 rounded-full bg-current/10 overflow-hidden relative">
-                      <div className="absolute inset-0 h-full bg-cyan-500/20 transition-all duration-1000"></div>
-                      <div className="h-full bg-cyan-500 transition-all duration-700 shadow-[0_0_10px_rgba(6,182,212,0.6)]" style={{ width: `${purifyProgress.percent}%` }}></div>
-                   </div>
-                </div>
-
-                <button onClick={() => purifierInputRef.current?.click()} className={`w-full aspect-square border-2 border-dashed rounded-[48px] flex flex-col items-center justify-center transition-all ${theme === 'dark' ? 'border-white/30 text-white/30 hover:bg-white/5 hover:border-blue-500/50 hover:text-blue-400' : 'border-gray-200 text-gray-200 hover:bg-gray-50'}`}>
-                   <span className="text-5xl mb-3">+</span>
-                   <span className="text-[11px] font-black uppercase tracking-widest">录入待处理样本</span>
-                </button>
-                <input type="file" ref={purifierInputRef} hidden multiple accept="image/*" onChange={(e) => {
-                  if (e.target.files) Array.from(e.target.files).forEach((file: any) => {
-                    const reader = new FileReader(); reader.onload = async (ev) => { setPurifyQueue(prev => [...prev, { id: `pur-${Date.now()}-${Math.random()}`, input: ev.target?.result as string, status: 'pending' }]); }; reader.readAsDataURL(file);
-                  });
-                }} />
-                
-                <button disabled={isPurifyingBatch || purifyQueue.filter(i => i.status === 'pending').length === 0} onClick={handlePurifyBatch} className="w-full bg-cyan-500 text-black py-5 rounded-3xl font-black text-[12px] uppercase shadow-2xl disabled:opacity-20 active:scale-95 transition-all hover:brightness-110">
-                  {isPurifyingBatch ? '并发执行中...' : '启动并发净化'}
-                </button>
-
-                <div className={`flex-1 rounded-[40px] p-6 overflow-y-auto border scrollbar-hide shadow-inner ${theme === 'dark' ? 'bg-[#16161a] border-white/10' : 'bg-gray-100 border-gray-200'}`}>
-                   <div className="space-y-3">
-                      {purifyQueue.map(item => (
-                         <div key={item.id} className={`flex items-center gap-4 p-3 rounded-2xl border ${theme === 'dark' ? 'border-white/20 bg-white/5' : 'border-black/5 bg-black/5'}`}>
-                            <img src={item.input} className="w-10 h-10 rounded-xl object-cover opacity-90 shadow-md" />
-                            <div className="flex-1 h-1.5 rounded-full bg-current/20 overflow-hidden relative">
-                               <div className={`h-full transition-all duration-1000 ${item.status === 'done' ? 'bg-green-500 shadow-[0_0_12px_rgba(34,197,94,0.8)]' : item.status === 'working' ? 'bg-cyan-500 animate-pulse' : item.status === 'error' ? 'bg-red-500' : 'w-0'}`} style={{ width: item.status === 'done' || item.status === 'error' ? '100%' : item.status === 'working' ? '65%' : '0' }}></div>
-                            </div>
-                         </div>
-                      ))}
-                   </div>
-                </div>
-             </div>
-             <div className="flex-1 grid grid-cols-2 gap-8 overflow-y-auto pr-3 scrollbar-hide pb-16">
-                {purifyQueue.filter(i => i.status === 'done' || i.status === 'working' || i.status === 'error').map(item => (
-                   <div key={item.id} className={`rounded-[48px] p-10 border flex flex-col gap-6 animate-in zoom-in ${theme === 'dark' ? 'bg-[#1a1a1e] border-white/20 shadow-2xl' : 'bg-[#fafafa] border-gray-200 shadow-md'}`}>
-                      <div className="flex justify-between items-center">
-                        <span className="text-[11px] font-black text-cyan-400 uppercase tracking-widest italic drop-shadow-md">Matrix Output</span>
-                        {item.output && <button onClick={() => downloadShot(item.output!, 'purified')} className="text-[10px] font-black text-white bg-blue-600 px-5 py-2 rounded-full shadow-lg hover:brightness-110 transition-all">导出无损成品</button>}
-                      </div>
-                      <div className="grid grid-cols-2 gap-10">
-                         <div className="space-y-4 text-center">
-                            <img src={item.input} className={`rounded-3xl w-full aspect-square object-cover border ${theme === 'dark' ? 'opacity-40 border-white/10' : 'opacity-30 grayscale border-black/5'}`} />
-                            <p className={`text-[9px] font-black uppercase ${theme === 'dark' ? 'text-white/60' : 'text-black/40'}`}>Raw Frame</p>
-                         </div>
-                         <div className="space-y-4 text-center">
-                            <div className={`relative aspect-square rounded-3xl overflow-hidden border-2 ${theme === 'dark' ? 'bg-[#000] border-white/30 shadow-[inset_0_4px_20px_rgba(0,0,0,1)]' : 'bg-white border-gray-200 shadow-inner'}`}>
-                               {item.output ? (
-                                 <img src={item.output} className="w-full h-full object-cover" />
-                               ) : item.status === 'error' ? (
-                                 <div className="w-full h-full flex items-center justify-center text-red-500 font-black text-[10px] uppercase">Failed</div>
-                               ) : (
-                                 <div className="w-full h-full flex flex-col items-center justify-center animate-pulse gap-3">
-                                   <div className="w-8 h-8 border-2 border-cyan-500/20 border-t-cyan-500 rounded-full animate-spin"></div>
-                                   <span className="text-[8px] text-cyan-500/70 uppercase font-black">Synthesizing...</span>
-                                 </div>
-                               )}
-                            </div>
-                            <p className="text-[9px] font-black text-cyan-500 uppercase tracking-[0.2em]">Purified Result</p>
-                         </div>
-                      </div>
-                   </div>
-                ))}
-             </div>
-          </div>
-        </div>
-      )}
-
-      {/* Theater View */}
-      {showTheater && (
-        <div className="fixed inset-0 bg-[#010102] z-[20000] flex flex-col animate-in zoom-in duration-300">
-          <div className="h-16 flex items-center justify-between px-12 border-b border-white/10 bg-black/80 backdrop-blur-3xl shrink-0">
-             <span className="text-blue-500 font-black italic tracking-[0.8em] text-[12px] uppercase">Theater Simulation Mode</span>
-             <button onClick={() => setShowTheater(false)} className="text-white/30 hover:text-white text-4xl font-light transition-all hover:rotate-90">×</button>
-          </div>
-          <div className="flex-1 overflow-y-auto p-16 space-y-40 scrollbar-hide pb-80">
-             {shots.filter(s => !s.id.startsWith('placeholder-')).map((shot, i) => (
-               <div key={shot.id} className="max-w-5xl mx-auto space-y-12 group">
-                  <div className="flex items-start gap-12">
-                     <span className="text-[120px] font-black text-white/5 font-mono select-none leading-none group-hover:text-blue-500/10 transition-colors">0{i+1}</span>
-                     <div className="pt-8">
-                        <h4 className="text-[12px] font-black text-blue-500 uppercase tracking-[0.5em] mb-5">{shot.name}</h4>
-                        <p className="text-5xl font-bold text-white leading-tight italic tracking-tight drop-shadow-2xl">{shot.chineseDescription}</p>
-                     </div>
-                  </div>
-                  <div className="aspect-video bg-zinc-950 rounded-[64px] overflow-hidden shadow-[0_80px_180px_rgba(0,0,0,1)] border border-white/20 relative transition-transform duration-1000 group-hover:scale-[1.015]">
-                     {shot.imageUrl ? (
-                        <>
-                          <img src={shot.imageUrl} className="w-full h-full object-cover" />
-                          <button onClick={() => downloadShot(shot.imageUrl!, shot.name)} className="absolute bottom-10 right-12 bg-blue-600/95 backdrop-blur-2xl text-white text-[12px] font-black px-12 py-6 rounded-full opacity-0 group-hover:opacity-100 transition-all hover:scale-110 active:scale-95 shadow-2xl uppercase tracking-[0.3em]">同步至本地</button>
-                        </>
-                     ) : (
-                        <div className="w-full h-full flex flex-col items-center justify-center text-white/5 uppercase font-black tracking-widest italic animate-pulse gap-5"><div className="w-16 h-16 border-4 border-white/5 border-t-blue-600 rounded-full animate-spin"></div>Rendering Media...</div>
-                     )}
-                  </div>
-               </div>
-             ))}
-          </div>
-        </div>
-      )}
-
-      {/* Welcome Screen */}
+      {/* Welcome */}
       {showWelcome && (
-        <div className="fixed inset-0 bg-[#050506] z-[3000] flex flex-col items-center justify-center p-6 text-white text-center">
-          <div className="max-w-xl animate-in fade-in slide-in-from-bottom-12 duration-1000">
-            <div className="w-28 h-28 bg-blue-600 rounded-[36px] mx-auto mb-12 flex items-center justify-center text-5xl font-black shadow-[0_30px_60px_rgba(37,99,235,0.4)] hover:scale-110 transition-transform cursor-pointer">PF</div>
-            <h1 className="text-5xl font-black mb-6 italic tracking-[0.2em] uppercase drop-shadow-lg">PromptFlow Studios</h1>
-            <p className="text-white/40 text-[11px] mb-16 font-black tracking-[0.5em] uppercase">Cinematic Anime Generation Core</p>
-            <div className="space-y-6 w-80 mx-auto">
-               <button onClick={() => setShowWelcome(false)} className="w-full bg-white text-black py-5 rounded-2xl font-black text-[13px] uppercase tracking-[0.4em] shadow-2xl hover:bg-blue-600 hover:text-white transition-all active:scale-95">启动生产中枢</button>
-               <button onClick={checkApiKey} className={`w-full py-4.5 rounded-2xl font-black text-[11px] border transition-all uppercase tracking-widest ${hasApiKey ? 'border-green-500/50 text-green-500 bg-green-500/10 shadow-[0_0_20px_rgba(34,197,94,0.2)]' : 'border-white/20 text-white/30 hover:border-white/40'}`}>
-                 {hasApiKey ? '✓ API Node Online' : 'Connect API Cluster'}
-               </button>
-            </div>
-          </div>
+        <div className="fixed inset-0 bg-[#020205] z-[9000] flex flex-col items-center justify-center p-8 text-white text-center animate-in fade-in duration-1000">
+            <div className="w-32 h-32 bg-blue-600 rounded-[40px] mb-12 flex items-center justify-center text-5xl font-black shadow-2xl">PF</div>
+            <h1 className="text-6xl font-black mb-10 italic uppercase tracking-[0.2em] opacity-90">PromptFlow V30.0</h1>
+            <button onClick={() => setShowWelcome(false)} className="px-16 py-6 bg-white text-black rounded-[24px] font-black text-sm uppercase tracking-[0.2em] hover:bg-blue-600 hover:text-white transition-all">进入创作空间</button>
         </div>
       )}
 
       <style>{`
         .scrollbar-hide::-webkit-scrollbar { display: none; }
-        .animate-in { animation: animate-in 0.5s cubic-bezier(0.16, 1, 0.3, 1); }
-        @keyframes animate-in { from { opacity: 0; transform: translateY(30px) scale(0.96); } to { opacity: 1; transform: translateY(0) scale(1); } }
-        ::selection { background: #2563eb; color: white; }
-        body { overflow: hidden; height: 100vh; background-color: ${theme === 'dark' ? '#050506' : '#f4f4f7'}; }
-        textarea { caret-color: #2563eb; }
-        ::-webkit-scrollbar { width: 4px; height: 4px; }
-        ::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.2); border-radius: 10px; }
-        .dark ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); }
-        input, textarea { outline: none !important; }
-        select { -webkit-appearance: none; -moz-appearance: none; appearance: none; }
+        .animate-in { animation: animate-in 0.8s cubic-bezier(0.16, 1, 0.3, 1); }
+        @keyframes animate-in { from { opacity: 0; transform: translateY(40px) scale(0.96); filter: blur(10px); } to { opacity: 1; transform: translateY(0) scale(1); filter: blur(0); } }
+        canvas { touch-action: none; background: transparent; }
       `}</style>
     </div>
   );
